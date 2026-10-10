@@ -22,9 +22,49 @@ does not touch the official `docker-compose.yml` (dev backing services).
   sessions are NOT verified** as recoverable.
 - **Not yet configured:** model provider and GitHub App. No real task,
   coding session, or PR has been run through this deployment.
+- **Local auth (Better Auth) is now supported** via the official
+  `@mastra/auth-better-auth` provider — see "Local auth (Better Auth)"
+  below for setup. Not yet live-verified in this deployment.
 - Latest probe evidence and verification details:
   `~/apps/mastra-factory/VERIFIED-STATUS.md` (in the primary checkout;
   supersedes this file's initial auth-disabled spike wording).
+
+## Local auth (Better Auth)
+
+For fully local authentication (no Mastra platform, no WorkOS), set these
+vars in `.env.local`:
+
+```
+FACTORY_AUTH_PROVIDER=better-auth
+BETTER_AUTH_SECRET=<openssl rand -base64 32>   # >= 32 chars, session signing
+FACTORY_SIGNUP_ENABLED=1                       # ONLY for the first boot
+```
+
+The app then uses the official `@mastra/auth-better-auth` provider in
+deferred mode: it builds its Better Auth instance on the app's own auth
+database — the same Postgres as `DATABASE_URL` (`state/postgres`) — and
+auto-bootstraps the owner's personal organization. No separate auth
+database, identity config, or external service is involved.
+
+One-time owner bootstrap:
+
+1. Set `FACTORY_SIGNUP_ENABLED=1`, rebuild/restart, and open the app over
+   the loopback/SSH tunnel (http://127.0.0.1:4112, or the forwarded port
+   on your PC). Keep the deployment loopback-only while sign-up is open —
+   never expose port 4112 to the LAN/internet in this state.
+2. Register the owner account **through the app's own sign-up UI**, choosing
+   your own password. Nothing reads or generates credentials for you —
+   do this yourself in the browser.
+3. Remove `FACTORY_SIGNUP_ENABLED` from `.env.local` and restart the app
+   (`docker compose --env-file .env.local -f compose.local.yml up -d
+   --force-recreate app`). Public sign-up is then closed and the
+   deployment stays single-user.
+
+Local auth data (users, sessions, orgs) lives in the same Postgres as all
+other app state, so it is covered by the existing `state/postgres` backup
+and `pg_dump` routine — losing the DB means losing the login; losing
+`BETTER_AUTH_SECRET` means existing sessions cannot be verified (users
+re-authenticate; no data loss).
 
 ## Prerequisites
 
@@ -153,15 +193,15 @@ only" above.
 
 ## Limitations of this local deployment
 
-- **Auth:** current deployment runs `MASTRACODE_AUTH_DISABLED=0` with the
-  official default Mastra Platform sign-in (not fully local auth).
+- **Auth:** the template supports fully local auth via
+  `FACTORY_AUTH_PROVIDER=better-auth` (see "Local auth (Better Auth)"
+  above); this deployment has not yet been switched over and live-verified.
   `MASTRACODE_AUTH_DISABLED=1` is a supported template opt-out (checked in
   `src/mastra/index.ts`), but it was live-tested and is **not a working
   Factory**: the UI stalled on the loader and project list/create returned
-  401. Never expose 4112 on a LAN/public interface; a fully local auth
-  provider (e.g. Better Auth, supported but not yet configured) is needed
-  to meet the strict local-auth requirement (requires
-  `FACTORY_CREDENTIAL_ENCRYPTION_KEY`, see `.env.schema`).
+  401. Never expose 4112 on a LAN/public interface — with auth enabled,
+  keep it on loopback/SSH-tunnel access, and only open sign-up for the
+  one-time owner registration.
 - The DB is pgvector **pg17** per the spike spec (official dev compose uses
   pg18); single-node Postgres, no host port.
 - Sandboxes run as local `LocalSandbox` under `/sandboxes` inside the app

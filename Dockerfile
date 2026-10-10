@@ -21,20 +21,24 @@ WORKDIR /app
 COPY package.json package-lock.json pnpm-workspace.yaml ./
 RUN npm ci --no-audit --no-fund
 
-# 2) Copy source and gate the image on typecheck + Mastra build.
-COPY . .
+# 2) Copy source (owned by the runtime user so no recursive chown is needed
+#    later) and gate the image on typecheck + Mastra build.
+COPY --chown=node:node . .
 RUN npm run check && npm run build
 
 # Runtime layout:
 #   HOME          -> /home/node       (bind-mounted ./state/home by compose)
 #   sandbox root  -> /sandboxes       (bind-mounted ./state/sandboxes)
-# Both are owned by the non-root `node` user (uid 1000). The build above ran
-# as root, so hand the tree to uid 1000 before switching.
+# Both are owned by the non-root `node` user (uid 1000). Source and
+# node_modules were already chowned via COPY --chown; only the writable
+# `.mastra` build-output directory (plus HOME/sandboxes) needs chown here —
+# a non-recursive chown of the directory itself, so build output files stay
+# root-owned but readable, which is all the runtime needs.
 ENV HOME=/home/node \
     NODE_ENV=production \
     PORT=4111
 RUN mkdir -p /home/node /sandboxes /app/.mastra \
-  && chown -R node:node /app /home/node /sandboxes
+  && chown node:node /app/.mastra /home/node /sandboxes
 
 USER node
 EXPOSE 4111

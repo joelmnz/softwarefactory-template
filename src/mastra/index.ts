@@ -28,6 +28,7 @@ import { E2BSandbox, createRepoTemplate as createE2BRepoTemplate } from '@mastra
 import { RedisStreamsPubSub } from '@mastra/redis-streams';
 import { getDatabasePath } from '@mastra/code-sdk/utils/project';
 import { DEFAULT_RETENTION } from '@mastra/code-sdk/utils/storage-maintenance';
+import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
 import { MastraAuthWorkos } from '@mastra/auth-workos';
 import { createFactorySecretEncryption, MastraFactory } from '@mastra/factory';
 import { GithubIntegration } from '@mastra/factory/integrations/github/integration';
@@ -120,12 +121,21 @@ if (redisUrl) {
 
 // Auth selection, ordered by how explicit the operator's intent is:
 //   1. MASTRACODE_AUTH_DISABLED=1 — explicit opt-out, auth off entirely.
-//   2. MASTRA_SHARED_API_URL — explicit platform deferral; identity rides the
+//   2. FACTORY_AUTH_PROVIDER=better-auth — self-hosted local sign-in via the
+//      official @mastra/auth-better-auth provider in deferred mode: it builds
+//      its own betterAuth() instance on the host's auth database (the same
+//      FactoryStorage tables above — no separate auth database or identity
+//      config), mounts its own handler, and auto-bootstraps the owner's
+//      personal org. Requires BETTER_AUTH_SECRET (>=32 chars) for session
+//      signing. `FACTORY_SIGNUP_ENABLED=1` opens public sign-up; keep it off
+//      (default) after the owner account exists so a loopback-only deployment
+//      stays single-user.
+//   3. MASTRA_SHARED_API_URL — explicit platform deferral; identity rides the
 //      shared platform API (`.env.schema` names this the highest-precedence
 //      auth config), so it wins even over a configured WORKOS_* pair — but
 //      loudly, because silently ignoring sign-in config is how self-hosted
 //      logins end up 302-ing somewhere that rejects their redirect_uri.
-//   3. WORKOS_API_KEY + WORKOS_CLIENT_ID — self-managed WorkOS sign-in. The
+//   4. WORKOS_API_KEY + WORKOS_CLIENT_ID — self-managed WorkOS sign-in. The
 //      constructor reads the rest of the WORKOS_* group from env, and
 //      `init()` derives the /auth/callback redirect from the deployment's
 //      publicUrl when WORKOS_REDIRECT_URI is unset. `fetchMemberships` lets
@@ -135,14 +145,29 @@ if (redisUrl) {
 //      compute/integration credentials (sandboxes, GitHub/Linear slots), not
 //      identity signals — platform compute plus self-managed sign-in is a
 //      supported combination.
-//   4. Nothing configured — leave undefined and MastraFactory installs its
+//   5. Nothing configured — leave undefined and MastraFactory installs its
 //      platform-backed default provider.
 const authDisabled = process.env.MASTRACODE_AUTH_DISABLED === '1';
+const betterAuthRequested = process.env.FACTORY_AUTH_PROVIDER?.trim() === 'better-auth';
 const workosConfigured = Boolean(process.env.WORKOS_API_KEY?.trim() && process.env.WORKOS_CLIENT_ID?.trim());
 let auth: IMastraAuthProvider | null | undefined;
 
 if (authDisabled) {
   auth = null;
+} else if (betterAuthRequested) {
+  const betterAuthSecret = process.env.BETTER_AUTH_SECRET?.trim();
+  if (!betterAuthSecret || betterAuthSecret.length < 32) {
+    throw new Error(
+      'FACTORY_AUTH_PROVIDER=better-auth requires BETTER_AUTH_SECRET: a nonempty secret of at least 32 ' +
+        'characters for session signing. Generate one with `openssl rand -base64 32`.',
+    );
+  }
+  auth = new MastraAuthBetterAuth({
+    secret: betterAuthSecret,
+    // Public sign-up stays closed unless the operator explicitly opens it for
+    // the one-time owner bootstrap (see LOCAL-OPERATIONS.md).
+    signUpEnabled: process.env.FACTORY_SIGNUP_ENABLED === '1',
+  });
 } else if (process.env.MASTRA_SHARED_API_URL?.trim()) {
   if (workosConfigured) {
     console.warn(
