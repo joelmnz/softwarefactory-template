@@ -4,6 +4,28 @@ How to run, stop, and maintain the local Docker deployment defined by
 `Dockerfile` + `compose.local.yml`. This is a self-contained deployment; it
 does not touch the official `docker-compose.yml` (dev backing services).
 
+## Current state (verified 2026-10-10)
+
+- The Docker image was **built and is running** from the primary checkout
+  at `~/apps/mastra-factory` (`mastracode-local-app-1` +
+  `mastracode-local-db-1`, loopback `127.0.0.1:4112` only). The original
+  package build (`npm ci` + check + build inside the image) succeeded.
+- **Auth:** `MASTRACODE_AUTH_DISABLED=0` — the app uses the official
+  default Mastra Platform sign-in. This is **not** fully local
+  authentication, and completing sign-in has not been verified yet.
+- **No-auth mode was live-tested and does not work as a Factory:** the UI
+  stalled on the loader (`/auth/me` recheck loop) and project list/create
+  returned 401. Do not use or recommend `MASTRACODE_AUTH_DISABLED=1` as a
+  working Factory configuration.
+- **Persistence:** DB data, home, and workspace marker files survived
+  container recreation. These are storage tests only — **active agent
+  sessions are NOT verified** as recoverable.
+- **Not yet configured:** model provider and GitHub App. No real task,
+  coding session, or PR has been run through this deployment.
+- Latest probe evidence and verification details:
+  `~/apps/mastra-factory/VERIFIED-STATUS.md` (in the primary checkout;
+  supersedes this file's initial auth-disabled spike wording).
+
 ## Prerequisites
 
 - **GitHub App (required):** the Factory needs a self-hosted GitHub App
@@ -27,12 +49,18 @@ does not touch the official `docker-compose.yml` (dev backing services).
 
 ## First-time setup (host, once)
 
-Create the persistent state directories and hand them to the app's uid 1000:
+Create the persistent state directories:
 
 ```sh
 mkdir -p state/postgres state/home state/sandboxes
-sudo chown -R 1000:1000 state/home state/sandboxes   # postgres dir is owned by the db container's entrypoint
 ```
+
+The host user is already uid 1000 (the app's uid), so **no `chown` is
+needed** — the app can use the directories as created. Before recreating
+them on an existing install, check ownership first (`ls -ln state`): the
+dirs must be owned by uid 1000; if they exist with different ownership,
+fix that before starting the app. `state/postgres` is owned/handled by the
+db container's entrypoint.
 
 `state/postgres` must be empty on first start (or contain a previous
 postgres data dir); the postgres entrypoint initializes it.
@@ -60,6 +88,13 @@ docker compose --env-file .env.local -f compose.local.yml restart
 
 App URL on the host: **http://127.0.0.1:4112** (bound to loopback only;
 container listens on 4111).
+
+From Joel's PC, reach it over an SSH tunnel (no LAN/public exposure):
+
+```sh
+ssh -L 4112:127.0.0.1:4112 joelai@192.168.1.215
+# then open http://localhost:4112 on the PC
+```
 
 ## Logs
 
@@ -118,24 +153,28 @@ only" above.
 
 ## Limitations of this local deployment
 
-- **Auth (`MASTRACODE_AUTH_DISABLED=1`):** this is a supported template
-  opt-out (checked in `src/mastra/index.ts`). It disables all sign-in and
-  per-session security isolation — anyone who can reach the port is treated
-  as the single local operator, and sessions are not isolated from each
-  other. This is only acceptable because the port is bound to
-  `127.0.0.1:4112` (host loopback). Do not expose 4112 on a LAN/public
-  interface; for real auth, configure WorkOS in `.env.local` instead of
-  `MASTRACODE_AUTH_DISABLED=1` (requires `FACTORY_CREDENTIAL_ENCRYPTION_KEY`,
-  see `.env.schema`).
+- **Auth:** current deployment runs `MASTRACODE_AUTH_DISABLED=0` with the
+  official default Mastra Platform sign-in (not fully local auth).
+  `MASTRACODE_AUTH_DISABLED=1` is a supported template opt-out (checked in
+  `src/mastra/index.ts`), but it was live-tested and is **not a working
+  Factory**: the UI stalled on the loader and project list/create returned
+  401. Never expose 4112 on a LAN/public interface; a fully local auth
+  provider (e.g. Better Auth, supported but not yet configured) is needed
+  to meet the strict local-auth requirement (requires
+  `FACTORY_CREDENTIAL_ENCRYPTION_KEY`, see `.env.schema`).
 - The DB is pgvector **pg17** per the spike spec (official dev compose uses
   pg18); single-node Postgres, no host port.
 - Sandboxes run as local `LocalSandbox` under `/sandboxes` inside the app
   container — coding agents work in the app container's filesystem (git/gh/
   python3/build-essential are installed there), no Docker-in-Docker.
+  **Isolation caveat:** these are separate directories inside one shared
+  app container, not security boundaries — agents can reach the server's
+  filesystem and secrets. Only connect **trusted repositories**.
+  Independent VM/container sandboxes would require an official compatible
+  provider.
 - Resource limits: app 4 GB, db 1 GB — raise via `mem_limit` if agents run
   out of memory.
 - The container entrypoint is `mastra start` directly (not `npm run start`)
   because `varlock run` requires an on-disk `.env` file, which this
   deployment deliberately does not bake into the image. Env is injected by
   compose from `.env.local`.
-- Actual image build was deferred to Janet (see SPIKE-REPORT.md).
