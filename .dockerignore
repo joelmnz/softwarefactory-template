@@ -1,0 +1,16 @@
+# Keep secrets, local state, and VCS/agent metadata out of the build context.
+node_modules/
+.git/
+.mastra/
+state/
+.env
+.env.*
+!.env.example
+!.env.schema
+*.log
+.DS_Store
+SPIKE-*.md
+
+# Agent-session metadata, not part of the app.
+.agents/
+.claude/
