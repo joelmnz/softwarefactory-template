@@ -1,5 +1,7 @@
 # Keep secrets, local state, and VCS/agent metadata out of the build context.
-node_modules/
+# no trailing slash: must also match the node_modules symlink
+node_modules
+
 .git/
 .mastra/
 state/

@@ -1,4 +1,5 @@
-node_modules/
+# no trailing slash: must also match the node_modules symlink
+node_modules
 .env
 .env.*
 !.env.example

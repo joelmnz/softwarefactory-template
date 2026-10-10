@@ -46,8 +46,10 @@ docker compose --env-file .env.local -f compose.local.yml up -d --build
 # Subsequent starts
 docker compose --env-file .env.local -f compose.local.yml up -d
 
-# Stop (keeps all state in ./state)
-docker compose -f compose.local.yml down
+# Stop (keeps all state in ./state). --env-file is required even for `down`:
+# compose interpolates ${POSTGRES_PASSWORD:?...} when parsing the file, so it
+# hard-fails without it.
+docker compose --env-file .env.local -f compose.local.yml down
 
 # Restart app only (e.g. after .env.local change)
 docker compose --env-file .env.local -f compose.local.yml up -d --force-recreate app
@@ -62,9 +64,9 @@ container listens on 4111).
 ## Logs
 
 ```sh
-docker compose -f compose.local.yml logs -f app
-docker compose -f compose.local.yml logs -f db
-docker compose -f compose.local.yml logs -f --tail=200
+docker compose --env-file .env.local -f compose.local.yml logs -f app
+docker compose --env-file .env.local -f compose.local.yml logs -f db
+docker compose --env-file .env.local -f compose.local.yml logs -f --tail=200
 ```
 
 ## State preservation & backup
@@ -75,16 +77,16 @@ All persistent state lives on the host under `./state/`:
 | ------------------ | ------------------------------------------ | --------------------------------- |
 | `state/postgres`   | Postgres data dir (all app/agent data)     | `pg_dump` while running, or stop + copy the directory |
 | `state/home`       | App user HOME (git config, caches)         | plain copy                        |
-| `state/sandboxes`  | Per-session repo checkouts                 | disposable; safe to clear when no session is running |
+| `state/sandboxes`  | Per-session repo checkouts                 | **NOT disposable** — may contain active unpushed agent changes; stop the app, then copy the directory (optionally `git -C <sandbox> status` first to identify in-flight work) |
 
 Backup the database (preferred, consistent):
 
 ```sh
-docker compose -f compose.local.yml exec db \
+docker compose --env-file .env.local -f compose.local.yml exec db \
   pg_dump -U user -d mastracode_web > backup/mastracode_web_$(date +%F).sql
 ```
 
-**Never** run `docker compose -f compose.local.yml down -v` thinking it clears
+**Never** run `docker compose --env-file .env.local -f compose.local.yml down -v` thinking it clears
 caches: this stack uses bind mounts (not named volumes), but as a rule
 `down -v` discards volumes and is forbidden for this deployment — state
 destruction is done only by deliberate host-side deletion of `./state/*`
@@ -97,10 +99,22 @@ encrypted-at-rest integration credentials.
 
 ## Rebuild after source changes
 
+This worktree is a **local spike branch** (`spike/local-docker`) with **no
+remote** — there is nothing to `git pull`; a plain pull just fails.
+Updates arrive only via a deliberate merge from the upstream branch the
+spike was cut from (base `14db15a`):
+
 ```sh
-git pull            # in the worktree
+# 1. Bring in upstream changes (deliberate, reviewed — do not blind-merge)
+git fetch <upstream-remote>            # or merge from the primary checkout
+git merge <upstream-remote>/main       # resolve packaging files if touched
+
+# 2. Rebuild the image (required after any source/lockfile/Dockerfile change)
 docker compose --env-file .env.local -f compose.local.yml up -d --build
 ```
+
+If you only changed `.env.local`, no rebuild is needed — see "Restart app
+only" above.
 
 ## Limitations of this local deployment
 
