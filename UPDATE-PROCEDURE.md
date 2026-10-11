@@ -89,8 +89,7 @@ decide whether a template update, package update, or both are warranted.
    ```
 
    If `main` is already checked out elsewhere (occupied): **stop and report**, use that existing
-   worktree only after review, never force-remove it. The local `main` ref may be updated only while
-   not checked out anywhere — the dedicated worktree satisfies this.
+   worktree only after review, never force-remove it.
 3. **Integrate into live in a fresh candidate worktree** (never the running primary checkout, never
    rebasing `live`; the candidate can never reuse the live checkout itself — it is already checked
    out in the primary):
@@ -147,10 +146,13 @@ Run in the candidate worktree from Stream A step 3 (both streams share this work
 
 ## Candidate build (both streams; required before rollout)
 
-Requires Node ≥ 22.19.0 (see `engines` in `package.json`). Use the `$SCRATCH` empty userconfig
-(host `~/.npmrc` has allow-scripts config that previously broke builds):
+Requires Node ≥ 22.19.0 (see `engines` in `package.json`). Use a scratch empty userconfig
+(host `~/.npmrc` has allow-scripts config that previously broke builds). Initialize `SCRATCH` here,
+even for a template-only flow where Stream B never ran — never assume it exists from an earlier
+step:
 
 ```sh
+SCRATCH=$(mktemp -d "${TMPDIR:-$HOME/.hermes/cache/scratch}/factory-update.XXXXXX")
 : > "$SCRATCH/empty-npmrc"
 NPM_CONFIG_USERCONFIG="$SCRATCH/empty-npmrc" npm ci --no-audit --no-fund
 NPM_CONFIG_USERCONFIG="$SCRATCH/empty-npmrc" npm run check
@@ -195,13 +197,20 @@ this documentation task's publication is authorized separately from any future a
 
 ```sh
 git fetch origin live
+# REVIEWED_BASE = the exact origin/live SHA recorded when the review gate approved this candidate
 git merge-base --is-ancestor origin/live HEAD \
-  && echo "origin/live unchanged since review" \
-  || echo "STOP: origin/live advanced — reconcile first"
+  || { echo "STOP: origin/live is not an ancestor of HEAD — reconcile; never force"; exit 1; }
+# Containment is NOT proof the remote is unchanged — also compare against the reviewed base:
+test "$(git rev-parse origin/live)" = "$REVIEWED_BASE" \
+  || { echo "STOP: origin/live advanced past the reviewed base — reconcile (merge, re-run
+        verification and build, re-review); never force"; exit 1; }
 ```
 
-If `origin/live` advanced past the reviewed base: reconcile (merge, re-run verification and build,
-re-review) — never force. Then, only with approval: `git push origin HEAD:live`.
+The ancestor test is **containment only** — it does not prove the remote is unchanged, because HEAD
+may include commits beyond the reviewed base. Passing it is not enough: `origin/live` must also
+equal the reviewed base exactly. If either check fails — including an advanced-but-still-ancestor
+`origin/live` — **STOP**: reconcile (merge into a refreshed candidate, re-run verification and
+build, re-review) — never force. Then, only with approval: `git push origin HEAD:live`.
 
 ## Rollout (MANUAL, separately approved — do not script or automate)
 
@@ -235,6 +244,8 @@ Joel approves each rollout explicitly. Run as the operator with an explicit
    never printed — no `head`, no `cat`:
 
    ```sh
+   # validate compose config BEFORE stopping anything
+   docker compose --env-file .env.local -f compose.local.yml config --quiet
    docker compose --env-file .env.local -f compose.local.yml stop app
    docker compose --env-file .env.local -f compose.local.yml exec -T db \
      sh -c 'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
@@ -265,12 +276,11 @@ Joel approves each rollout explicitly. Run as the operator with an explicit
    git status --short           # tolerate known untracked operator files; flag collisions; no reset
    git merge --ff-only origin/live
    ```
-7. **Swap images.** Validate compose config **before stopping anything**, then retag the approved
-   candidate to `latest` only at this rollout approval gate (after the backup exists). Then always
-   the **app-targeted** command — never an unqualified `up`:
+7. **Swap images.** Compose config was already validated **before the app was stopped** in step 3;
+   retag the approved candidate to `latest` only at this rollout approval gate (after the backup
+   exists). Then always the **app-targeted** command — never an unqualified `up`:
 
    ```sh
-   docker compose --env-file .env.local -f compose.local.yml config --quiet
    docker tag "mastracode-local:candidate-${COMMIT}" mastracode-local:latest
    docker compose --env-file .env.local -f compose.local.yml \
      up -d --no-build --no-deps --force-recreate app
@@ -279,23 +289,26 @@ Joel approves each rollout explicitly. Run as the operator with an explicit
 ## Post-rollout verification (record all results in VERIFIED-STATUS.md)
 
 ```sh
-docker inspect --format '{{.Id}}' mastracode-local-app-1  # == candidate image ID
-docker inspect --format '{{.Id}}' mastracode-local-db-1   # DB CONTAINER ID unchanged — not
-                                                          # merely the same image
-docker port mastracode-local-app-1                        # 127.0.0.1:4112 only
+docker inspect --format '{{.Image}}' mastracode-local-app-1  # == candidate IMAGE ID (image SHA,
+                                                             # not the container ID)
+docker inspect --format '{{.Id}}' mastracode-local-db-1      # DB CONTAINER ID unchanged — not
+                                                             # merely the same image
+docker port mastracode-local-app-1                           # 127.0.0.1:4112 only
 docker exec mastracode-local-app-1 sh -c 'echo $FACTORY_SIGNUP_ENABLED'
-# compare against the exact whitelisted FACTORY_SIGNUP_ENABLED shell value set in .env.local —
-# that exact value only; never fall back to dumping or grepping the full environment (never print env)
+# must print EXACTLY 0 (signup off) — that exact value only; never fall back to dumping or
+# grepping the full environment (never print env)
 for path in signin:200 api/factory/projects:401; do
   p=${path%:*}; want=${path##*:}
-  curl -sS -o /dev/null -w "%{http_code} $p\n" \
+  curl -sS -o /dev/null -w "%{http_code} ssl_verify_result=%{ssl_verify_result} $p\n" \
     --cacert /home/joelai/apps/paperclip/tls/ca.crt \
     --resolve factory.janet.localdev:443:192.168.1.215 \
-    "https://factory.janet.localdev/$p"                   # expect $want
+    "https://factory.janet.localdev/$p"  # expect "$want" AND ssl_verify_result 0 (cert verified)
 done
 ```
 
-`curl -sS` surfaces TLS failures on stderr; the CA file verifies the certificate. HTTP status codes
+`curl -sS` surfaces TLS failures on stderr; the CA file verifies the certificate, and
+`%{ssl_verify_result}` must be exactly `0` — the expected HTTP status alone is not sufficient if
+the certificate did not verify. HTTP status codes
 alone do **not** prove authenticated functionality. The **owner** then confirms in the browser:
 login works, GitHub connection works, one bounded real model-backed task completes end-to-end —
 never claim auth functionality without this confirmation.
