@@ -171,6 +171,30 @@ on_exit() {
   fi
   exit "$rc"   # preserve the original exit code through the trap
 }
+# Idempotent rollback: restores .env.local and (if the app was ever run on
+# the new env) reconciles it back onto the previous env. Guarded by
+# ENV_ROLLED_BACK so the EXIT trap and the inline failure handlers below
+# never perform the restore twice.
+# Defined BEFORE `trap on_exit EXIT` so a failure in the env-editing section
+# (which arms ENV_TOUCHED) can never reach the trap with this function
+# undefined.
+restore_env_and_app() {
+  [[ $ENV_ROLLED_BACK -eq 1 ]] && return 0
+  ENV_ROLLED_BACK=1
+  log "restoring .env.local from backup"
+  cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"
+  if [[ $APP_RECREATE_ATTEMPTED -eq 1 ]]; then
+    # Env-file content is part of compose's service config, so this
+    # reconciles the container back onto the previous env (recreating it
+    # if it was ever run on the new env).
+    runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build app \
+      || log "WARNING: restore-recreate of app failed — check docker compose logs manually"
+  fi
+  # NOTE: compose.local.yml binds 127.0.0.1:4112, so after this rollback the
+  # app STAYS on the loopback binding — plain-HTTP LAN access is NOT restored
+  # (and nginx was never reloaded). LAN reachability is lost until the script
+  # is re-run successfully or the compose binding is changed explicitly.
+}
 trap on_exit EXIT
 
 # ------------------------------------------------------------ leaf cert: reuse or issue
@@ -311,27 +335,6 @@ else
 fi
 
 # ------------------------------------ reconcile app as joelai; verify readiness
-# Idempotent rollback: restores .env.local and (if the app was ever run on
-# the new env) reconciles it back onto the previous env. Guarded by
-# ENV_ROLLED_BACK so the EXIT trap and the inline failure handlers below
-# never perform the restore twice.
-restore_env_and_app() {
-  [[ $ENV_ROLLED_BACK -eq 1 ]] && return 0
-  ENV_ROLLED_BACK=1
-  log "restoring .env.local from backup"
-  cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"
-  if [[ $APP_RECREATE_ATTEMPTED -eq 1 ]]; then
-    # Env-file content is part of compose's service config, so this
-    # reconciles the container back onto the previous env (recreating it
-    # if it was ever run on the new env).
-    runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build app \
-      || log "WARNING: restore-recreate of app failed — check docker compose logs manually"
-  fi
-  # NOTE: compose.local.yml binds 127.0.0.1:4112, so after this rollback the
-  # app STAYS on the loopback binding — plain-HTTP LAN access is NOT restored
-  # (and nginx was never reloaded). LAN reachability is lost until the script
-  # is re-run successfully or the compose binding is changed explicitly.
-}
 # An env identical to the backup does NOT prove the RUNNING container already
 # has the loopback binding / the new env — a pre-HTTPS container may still be
 # bound to 192.168.1.215:4112. `up -d --no-build app` is idempotent: compose
@@ -359,7 +362,10 @@ log "backend ready on 127.0.0.1:4112 (signed-out /signin returned 200)"
 if ! nginx -t; then
   die "pre-reload nginx -t failed — config NOT reloaded, running nginx untouched; exit trap restores the managed files AND .env.local (app reconciled back if it was run on the new env)"
 fi
-ARMED=0   # past this point nothing is rolled back automatically (reload makes it live)
+ARMED=0       # past this point nothing is rolled back automatically (reload makes it live)
+ENV_TOUCHED=0 # disarms env rollback too: after the reload the new env is live,
+              # so a failed post-reload verification must NOT restore the old
+              # .env.local beneath the running (now TLS-fronted) nginx
 systemctl reload nginx || die "nginx reload failed — config is valid on disk; check systemctl status nginx"
 
 # ------------------------------------------------------ strict verification
