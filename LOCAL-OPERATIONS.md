@@ -11,9 +11,10 @@ does not touch the official `docker-compose.yml` (dev backing services).
   `mastracode-local-db-1`, bound to LAN address `192.168.1.215:4112` only).
   The original
   package build (`npm ci` + check + build inside the image) succeeded.
-- **Auth:** `MASTRACODE_AUTH_DISABLED=0` — the app uses the official
-  default Mastra Platform sign-in. This is **not** fully local
-  authentication, and completing sign-in has not been verified yet.
+- **Auth:** configured with the official local Better Auth provider
+  (`FACTORY_AUTH_PROVIDER=better-auth`, `@mastra/auth-better-auth`).
+  Login and sign-up forms are verified; the owner account is still
+  pending creation.
 - **No-auth mode was live-tested and does not work as a Factory:** the UI
   stalled on the loader (`/auth/me` recheck loop) and project list/create
   returned 401. Do not use or recommend `MASTRACODE_AUTH_DISABLED=1` as a
@@ -23,9 +24,9 @@ does not touch the official `docker-compose.yml` (dev backing services).
   sessions are NOT verified** as recoverable.
 - **Not yet configured:** model provider and GitHub App. No real task,
   coding session, or PR has been run through this deployment.
-- **Local auth (Better Auth) is now supported** via the official
+- **Local auth (Better Auth)** is active via the official
   `@mastra/auth-better-auth` provider — see "Local auth (Better Auth)"
-  below for setup. Not yet live-verified in this deployment.
+  below for setup and the owner bootstrap procedure.
 - Latest probe evidence and verification details:
   `~/apps/mastra-factory/VERIFIED-STATUS.md` (in the primary checkout;
   supersedes this file's initial auth-disabled spike wording).
@@ -49,17 +50,30 @@ database, identity config, or external service is involved.
 
 One-time owner bootstrap:
 
-1. Set `FACTORY_SIGNUP_ENABLED=1`, rebuild/restart, and open the app at
-   **http://192.168.1.215:4112** (direct LAN URL from a device on the
-   network). Keep the deployment bound to `192.168.1.215` only while
-   sign-up is open — never widen it to `0.0.0.0`, and do not expose it to
-   the internet in this state.
-2. Register the owner account **through the app's own sign-up UI**, choosing
+Registration is **disabled before the LAN deployment** (Janet ships it
+disabled; there are 0 existing users, so no account exists yet). Reopen
+it only for this controlled bootstrap, and only over a secure channel:
+
+1. Temporarily set `FACTORY_SIGNUP_ENABLED=1` in `.env.local`, rebuild
+   and restart the app.
+2. Before entering any credentials, connect over **HTTPS** (TLS reverse
+   proxy, once configured) or through an **encrypted SSH tunnel** —
+   never the plain-HTTP LAN URL:
+
+   ```sh
+   ssh -L 4112:192.168.1.215:4112 joelai@192.168.1.215
+   # then open http://localhost:4112 on the PC (loopback is not bound —
+   # the tunnel target must be the LAN IP)
+   ```
+
+   The tunnel encrypts its connection; the service itself stays bound
+   to the LAN address.
+3. Register the owner account **through the app's own sign-up UI**, choosing
    your own password. Nothing reads or generates credentials for you —
    do this yourself in the browser.
-3. Remove `FACTORY_SIGNUP_ENABLED` from `.env.local` and restart the app
+4. Remove `FACTORY_SIGNUP_ENABLED` from `.env.local` and restart the app
    (`docker compose --env-file .env.local -f compose.local.yml up -d
-   --force-recreate app`). Public sign-up is then closed and the
+   --force-recreate app`). Public sign-up is then closed again and the
    deployment stays single-user.
 
 Local auth data (users, sessions, orgs) lives in the same Postgres as all
@@ -142,8 +156,8 @@ App URL: **http://192.168.1.215:4112** (bound to the host LAN address
   and firewall, not this compose setting.
 
 Reach it directly from any device on the LAN at
-http://192.168.1.215:4112. For SSH-tunnel access instead (binds the app
-to the host only, no LAN exposure):
+http://192.168.1.215:4112. For an encrypted path to the app, use an SSH
+tunnel:
 
 ```sh
 ssh -L 4112:192.168.1.215:4112 joelai@192.168.1.215
@@ -208,16 +222,16 @@ only" above.
 
 ## Limitations of this local deployment
 
-- **Auth:** the template supports fully local auth via
-  `FACTORY_AUTH_PROVIDER=better-auth` (see "Local auth (Better Auth)"
-  above); this deployment has not yet been switched over and live-verified.
+- **Auth:** the deployment uses the official local Better Auth provider
+  via `FACTORY_AUTH_PROVIDER=better-auth` (see "Local auth (Better Auth)"
+  above); login/sign-up forms are verified, owner account still pending.
   `MASTRACODE_AUTH_DISABLED=1` is a supported template opt-out (checked in
   `src/mastra/index.ts`), but it was live-tested and is **not a working
   Factory**: the UI stalled on the loader and project list/create returned
-  401. Port 4112 is now bound to the LAN address `192.168.1.215` (not
-  `0.0.0.0`), which keeps it off the internet but reachable by any LAN
-  device — HTTP only, so do not enter passwords until HTTPS is configured,
-  and do not treat the LAN binding as internet firewall protection.
+  401. Port 4112 is bound to the LAN address `192.168.1.215` (not
+  `0.0.0.0`) — reachable by any LAN device; HTTP only, so do not enter
+  passwords until HTTPS is configured (or use the SSH tunnel), and do
+  not treat the LAN binding as internet firewall protection.
 - The DB is pgvector **pg17** per the spike spec (official dev compose uses
   pg18); single-node Postgres, no host port.
 - Sandboxes run as local `LocalSandbox` under `/sandboxes` inside the app
