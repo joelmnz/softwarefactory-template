@@ -8,7 +8,8 @@ does not touch the official `docker-compose.yml` (dev backing services).
 
 - The Docker image was **built and is running** from the primary checkout
   at `~/apps/mastra-factory` (`mastracode-local-app-1` +
-  `mastracode-local-db-1`, loopback `127.0.0.1:4112` only). The original
+  `mastracode-local-db-1`, bound to LAN address `192.168.1.215:4112` only).
+  The original
   package build (`npm ci` + check + build inside the image) succeeded.
 - **Auth:** `MASTRACODE_AUTH_DISABLED=0` — the app uses the official
   default Mastra Platform sign-in. This is **not** fully local
@@ -48,10 +49,11 @@ database, identity config, or external service is involved.
 
 One-time owner bootstrap:
 
-1. Set `FACTORY_SIGNUP_ENABLED=1`, rebuild/restart, and open the app over
-   the loopback/SSH tunnel (http://127.0.0.1:4112, or the forwarded port
-   on your PC). Keep the deployment loopback-only while sign-up is open —
-   never expose port 4112 to the LAN/internet in this state.
+1. Set `FACTORY_SIGNUP_ENABLED=1`, rebuild/restart, and open the app at
+   **http://192.168.1.215:4112** (direct LAN URL from a device on the
+   network). Keep the deployment bound to `192.168.1.215` only while
+   sign-up is open — never widen it to `0.0.0.0`, and do not expose it to
+   the internet in this state.
 2. Register the owner account **through the app's own sign-up UI**, choosing
    your own password. Nothing reads or generates credentials for you —
    do this yourself in the browser.
@@ -126,14 +128,27 @@ docker compose --env-file .env.local -f compose.local.yml up -d --force-recreate
 docker compose --env-file .env.local -f compose.local.yml restart
 ```
 
-App URL on the host: **http://127.0.0.1:4112** (bound to loopback only;
-container listens on 4111).
+App URL: **http://192.168.1.215:4112** (bound to the host LAN address
+`192.168.1.215`, not `0.0.0.0`; container listens on 4111).
 
-From Joel's PC, reach it over an SSH tunnel (no LAN/public exposure):
+**Security caveats for this binding (spike):**
+
+- This is plain **HTTP only**. Do **not** enter passwords or other
+  credentials through this URL until HTTPS is configured for the
+  deployment (e.g. a reverse proxy with TLS).
+- Binding to a LAN address is **not** proof of protection from the
+  internet — it is not a firewall boundary. Any device on the LAN can
+  reach the app; upstream/internet reachability depends on your router
+  and firewall, not this compose setting.
+
+Reach it directly from any device on the LAN at
+http://192.168.1.215:4112. For SSH-tunnel access instead (binds the app
+to the host only, no LAN exposure):
 
 ```sh
-ssh -L 4112:127.0.0.1:4112 joelai@192.168.1.215
-# then open http://localhost:4112 on the PC
+ssh -L 4112:192.168.1.215:4112 joelai@192.168.1.215
+# then open http://localhost:4112 on the PC (loopback is no longer bound —
+# the tunnel target must be the LAN IP)
 ```
 
 ## Logs
@@ -199,9 +214,10 @@ only" above.
   `MASTRACODE_AUTH_DISABLED=1` is a supported template opt-out (checked in
   `src/mastra/index.ts`), but it was live-tested and is **not a working
   Factory**: the UI stalled on the loader and project list/create returned
-  401. Never expose 4112 on a LAN/public interface — with auth enabled,
-  keep it on loopback/SSH-tunnel access, and only open sign-up for the
-  one-time owner registration.
+  401. Port 4112 is now bound to the LAN address `192.168.1.215` (not
+  `0.0.0.0`), which keeps it off the internet but reachable by any LAN
+  device — HTTP only, so do not enter passwords until HTTPS is configured,
+  and do not treat the LAN binding as internet firewall protection.
 - The DB is pgvector **pg17** per the spike spec (official dev compose uses
   pg18); single-node Postgres, no host port.
 - Sandboxes run as local `LocalSandbox` under `/sandboxes` inside the app

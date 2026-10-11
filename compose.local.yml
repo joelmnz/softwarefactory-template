@@ -15,7 +15,10 @@
 # Security posture:
 #   - app runs as uid 1000 (non-root), cap_drop ALL, no-new-privileges
 #   - no Docker socket mounted
-#   - app reachable only on host loopback 127.0.0.1:4112 (container 4111)
+#   - app reachable only on the host LAN address 192.168.1.215:4112
+#     (container 4111) — NOT 0.0.0.0, and not loopback anymore
+#   - HTTP only for this spike; do not enter passwords until HTTPS is
+#     configured; LAN binding is NOT proof of protection from the internet
 #   - db has no host port at all
 name: mastracode-local
 
@@ -31,8 +34,11 @@ services:
       - no-new-privileges:true
     mem_limit: 4g
     ports:
-      # Host loopback 4112 -> container 4111 (Mastra server default port).
-      - '127.0.0.1:4112:4111'
+      # Host LAN address 192.168.1.215:4112 -> container 4111 (Mastra server
+      # default port). Pinned to the LAN IP, not 0.0.0.0, so the app is only
+      # reachable from this host's LAN interface. HTTP only — see
+      # LOCAL-OPERATIONS.md before entering any credentials.
+      - '192.168.1.215:4112:4111'
     environment:
       HOME: /home/node
       MASTRACODE_LOCAL_SANDBOX_ROOT: /sandboxes

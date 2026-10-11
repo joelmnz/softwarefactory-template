@@ -5,6 +5,7 @@ node_modules
 !.env.example
 !.env.schema
 .mastra/
+voidauth.txt
 *.log
 .DS_Store
 
