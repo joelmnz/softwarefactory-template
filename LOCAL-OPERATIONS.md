@@ -1,5 +1,9 @@
 # Local Docker operations — MastraCode Web (spike)
 
+> **Historical runtime status.** This file's runtime status is superseded by
+> the primary checkout's `VERIFIED-STATUS.md` and the controlled update
+> procedure in `UPDATE-PROCEDURE.md`.
+
 How to run, stop, and maintain the local Docker deployment defined by
 `Dockerfile` + `compose.local.yml`. This is a self-contained deployment; it
 does not touch the official `docker-compose.yml` (dev backing services).
