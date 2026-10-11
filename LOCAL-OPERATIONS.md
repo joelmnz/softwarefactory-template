@@ -182,8 +182,10 @@ App URL — two distinct states, keep them apart:
   verified — status at the top of this file):**
   `https://factory.janet.localdev` via nginx (LAN :443, TLS 1.2/1.3,
   LAN-subnet allowlist) proxying to the app on `127.0.0.1:4112`. Plain HTTP
-  to the app is then loopback-only; the :80 listener only redirects the
-  Factory host to HTTPS.
+  to the app is then loopback-only; the :80 listener issues only a harmless
+  public 301 redirect to HTTPS (a `return` runs in the rewrite phase,
+  before the access phase, so port 80 carries no ACL — the LAN allowlist is
+  enforced on the HTTPS server that actually proxies the app).
 
 **Security caveats:**
 
@@ -241,15 +243,20 @@ What the script does (idempotent, fail-closed; safe to re-run):
    `MASTRACODE_ALLOWED_ORIGINS=https://factory.janet.localdev`,
    `FACTORY_SIGNUP_ENABLED=0` (secrets preserved, never printed; edits are
    atomic same-filesystem renames under `state/tls/` that preserve the
-   file's original ownership/mode; the app is recreated only when the env
-   content actually changed).
-5. Recreates only the `app` service (`up -d --no-build --force-recreate
-   app` as joelai), polls `http://127.0.0.1:4112/signin` with finite
-   retries; if the backend never comes up, it restores the `.env.local`
-   backup and recreates the app on the previous env before failing. After
-   such a rollback the app **stays on the loopback binding**
-   (`127.0.0.1:4112` per `compose.local.yml`) — plain-HTTP LAN access is
-   not restored.
+   file's original ownership/mode). An env identical to the backup does NOT
+   prove the running container already has the loopback binding, so the app
+   service is always reconciled (see step 5).
+5. Reconciles the `app` service (`up -d --no-build app` as joelai — always,
+   because identical env content does not prove the RUNNING container holds
+   the loopback binding; compose recreates only when its config differs, so a
+   fully reconciled rerun is a no-op without --force-recreate), then polls
+   `http://127.0.0.1:4112/signin` with the full retry budget; if the backend
+   never comes up, it restores the `.env.local` backup and reconciles the
+   app back onto the previous env before failing. On ANY pre-reload failure
+   (including a failed pre-reload `nginx -t`) the EXIT trap performs the
+   same restore exactly once and preserves the exit code. After such a
+   rollback the app **stays on the loopback binding** (`127.0.0.1:4112` per
+   `compose.local.yml`) — plain-HTTP LAN access is not restored.
 6. Reloads nginx only after the backend is verified, then requires
    `https://factory.janet.localdev/signin` → 200 (via
    `curl --cacert ~/apps/paperclip/tls/ca.crt --resolve`) and

@@ -19,9 +19,10 @@
 #     the LAN address. LAN devices reach the app through the nginx TLS
 #     reverse proxy (deployment/nginx-factory.conf, installed by
 #     deployment/install-local-https.sh) at https://factory.janet.localdev
-#     (nginx listens on 192.168.1.215:80/443, restricted to the LAN subnet,
-#     and terminates TLS with a leaf cert signed by the Janet LAN Paperclip
-#     CA). Until that script has been applied and verified, the RUNNING
+#     (nginx listens on 192.168.1.215:443, restricted to the LAN subnet; its
+#     :80 listener only issues a harmless public 301 redirect to HTTPS — and
+#     terminates TLS with a leaf cert signed by the Janet LAN Paperclip CA).
+#     Until that script has been applied and verified, the RUNNING
 #     container may still hold the previous 192.168.1.215:4112 HTTP binding.
 #   - db has no host port at all
 name: mastracode-local

@@ -18,8 +18,11 @@
 #              signing uses an explicit random -set_serial)
 # - Idempotent: reuses a matching, non-expired, CA-valid leaf cert/key pair
 #   under state/tls/ (gitignored) on rerun; re-installs nginx files safely;
-#   re-asserts the three .env.local keys (backup first, app recreated only
-#   if the env content actually changed).
+#   re-asserts the three .env.local keys (backup first). The app is always
+#   reconciled via `up -d --no-build app`: identical env content does NOT
+#   prove the running container already holds the loopback binding, and
+#   compose recreates only when its config actually differs (a fully
+#   reconciled rerun is a no-op).
 # - Managed-site marker: the installed Factory nginx site carries a
 #   `MANAGED-BY: install-local-https.sh` marker. If a pre-existing
 #   sites-available/factory lacks it, the script refuses to touch it
@@ -28,7 +31,9 @@
 #   every managed artifact (site file, enabled symlink, installed leaf
 #   cert/key) is backed up under state/tls/ before overwrite; on ANY
 #   pre-reload failure an EXIT trap restores all of them, .env.local is
-#   restored from its backup and the app is recreated on the previous env.
+#   restored from its backup and the app is reconciled back on the previous
+#   env (the rollback is guarded so it never runs twice; the original exit
+#   code is preserved).
 #   compose.local.yml binds the app to 127.0.0.1:4112, so after a rollback
 #   the app STAYS on the loopback binding (plain-HTTP LAN access is NOT
 #   restored; nginx was never reloaded).
@@ -103,6 +108,18 @@ log "pre-flight OK: running as root, primary checkout, CA present, app container
 BACKUP_DIR=""
 MANIFEST=""
 ARMED=0
+# Env rollback state (declared with the trap state so the EXIT trap can
+# restore .env.local on ANY pre-reload failure, including ones the inline
+# handlers below never see, e.g. a failed pre-reload nginx -t or a set -e hit):
+#   ENV_TOUCHED            — .env.local backup taken → env rollback is armed
+#   ENV_ROLLED_BACK        — dedupe guard: env already restored once
+#   APP_RECREATE_ATTEMPTED — the app was (attempted to be) run on the new env;
+#                            only then must the rollback reconcile it
+ENV_FILE=""
+ENV_BACKUP=""
+ENV_TOUCHED=0
+ENV_ROLLED_BACK=0
+APP_RECREATE_ATTEMPTED=0
 ensure_backup_dir() {
   [[ -n "$BACKUP_DIR" ]] && return 0
   BACKUP_DIR="$STATE_DIR/pre-change-backup-$(date +%Y%m%d-%H%M%S)"
@@ -138,15 +155,21 @@ restore_managed() {
 on_exit() {
   local rc=$?
   trap - EXIT
-  if [[ $rc -ne 0 && $ARMED -eq 1 ]]; then
-    log "pre-reload failure (rc=$rc) — restoring prior nginx/ssl state from $BACKUP_DIR"
-    restore_managed
-    if nginx -t >/dev/null 2>&1; then
-      log "rollback complete: on-disk nginx config matches the baseline again (nginx was NEVER reloaded, running config untouched)"
-    else
-      log "WARNING: nginx -t still fails after restore — investigate /etc/nginx manually (baseline had passed, so the drift is unexpected)"
+  if [[ $rc -ne 0 ]]; then
+    if [[ $ARMED -eq 1 ]]; then
+      log "pre-reload failure (rc=$rc) — restoring prior nginx/ssl state from $BACKUP_DIR"
+      restore_managed
+      if nginx -t >/dev/null 2>&1; then
+        log "rollback: on-disk nginx config matches the baseline again (nginx was NEVER reloaded, running config untouched)"
+      else
+        log "WARNING: nginx -t still fails after restore — investigate /etc/nginx manually (baseline had passed, so the drift is unexpected)"
+      fi
+    fi
+    if [[ $ENV_TOUCHED -eq 1 ]]; then
+      restore_env_and_app
     fi
   fi
+  exit "$rc"   # preserve the original exit code through the trap
 }
 trap on_exit EXIT
 
@@ -250,7 +273,8 @@ ENV_FILE="$ROOT/.env.local"
 [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing"
 ENV_BACKUP="$STATE_DIR/.env.local.backup-$(date +%Y%m%d-%H%M%S)"
 cp -p "$ENV_FILE" "$ENV_BACKUP"; chmod 600 "$ENV_BACKUP"
-log ".env.local backed up to $ENV_BACKUP (values never printed)"
+ENV_TOUCHED=1   # from here on, the EXIT trap restores .env.local on any failure
+log ".env.local backed up to $ENV_BACKUP (values never printed; rollback armed)"
 
 set_env_key() { # file KEY VALUE — replace existing KEY= line or append; comments preserved.
   # Temp file lives under state/tls (same filesystem as $ROOT) so the final
@@ -275,55 +299,65 @@ set_env_key "$ENV_FILE" "MASTRACODE_PUBLIC_URL" "$APP_URL"
 set_env_key "$ENV_FILE" "MASTRACODE_ALLOWED_ORIGINS" "$APP_URL"
 set_env_key "$ENV_FILE" "FACTORY_SIGNUP_ENABLED" "0"
 [[ "$(grep -c '^MASTRACODE_PUBLIC_URL=' "$ENV_FILE")" -eq 1 && "$(grep -c '^MASTRACODE_ALLOWED_ORIGINS=' "$ENV_FILE")" -eq 1 && "$(grep -c '^FACTORY_SIGNUP_ENABLED=' "$ENV_FILE")" -eq 1 ]] \
-  || { cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"; die ".env.local key assertion failed after edit; restored from backup"; }
+  || die ".env.local key assertion failed after edit — the EXIT trap restores the backup"
 chmod 600 "$ENV_FILE"
 
 ENV_CHANGED=0
 if cmp -s "$ENV_BACKUP" "$ENV_FILE"; then
-  log ".env.local already carries the target values — app recreate skipped"
+  log ".env.local already carries the target values (app service still reconciled below — the running container may predate the loopback binding)"
 else
   ENV_CHANGED=1
   log ".env.local updated: MASTRACODE_PUBLIC_URL / MASTRACODE_ALLOWED_ORIGINS = $APP_URL, FACTORY_SIGNUP_ENABLED = 0"
 fi
 
-# ------------------------------------ recreate app as joelai; verify readiness
+# ------------------------------------ reconcile app as joelai; verify readiness
+# Idempotent rollback: restores .env.local and (if the app was ever run on
+# the new env) reconciles it back onto the previous env. Guarded by
+# ENV_ROLLED_BACK so the EXIT trap and the inline failure handlers below
+# never perform the restore twice.
 restore_env_and_app() {
-  log "restoring .env.local from backup and recreating app on the previous env"
+  [[ $ENV_ROLLED_BACK -eq 1 ]] && return 0
+  ENV_ROLLED_BACK=1
+  log "restoring .env.local from backup"
   cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"
-  runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build --force-recreate app \
-    || log "WARNING: restore-recreate of app failed — check docker compose logs manually"
+  if [[ $APP_RECREATE_ATTEMPTED -eq 1 ]]; then
+    # Env-file content is part of compose's service config, so this
+    # reconciles the container back onto the previous env (recreating it
+    # if it was ever run on the new env).
+    runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build app \
+      || log "WARNING: restore-recreate of app failed — check docker compose logs manually"
+  fi
   # NOTE: compose.local.yml binds 127.0.0.1:4112, so after this rollback the
   # app STAYS on the loopback binding — plain-HTTP LAN access is NOT restored
   # (and nginx was never reloaded). LAN reachability is lost until the script
   # is re-run successfully or the compose binding is changed explicitly.
 }
-if [[ $ENV_CHANGED -eq 1 ]]; then
-  if ! runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build --force-recreate app; then
-    restore_env_and_app
-    die "app recreate failed; .env.local restored, app recreated on previous env (loopback binding kept), nginx NOT reloaded"
-  fi
+# An env identical to the backup does NOT prove the RUNNING container already
+# has the loopback binding / the new env — a pre-HTTPS container may still be
+# bound to 192.168.1.215:4112. `up -d --no-build app` is idempotent: compose
+# reconciles the binding/env and recreates the container only when its config
+# actually differs (no --force-recreate, so a fully reconciled rerun is a no-op).
+APP_RECREATE_ATTEMPTED=1
+if ! runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build app; then
+  restore_env_and_app
+  die "app reconcile failed; .env.local restored, app reconciled back on previous env (loopback binding kept), nginx NOT reloaded"
 fi
 
 READY=0
-TRIES=3
-if [[ $ENV_CHANGED -eq 1 ]]; then TRIES=30; fi   # full budget after recreate, short recheck on rerun
+TRIES=30   # full budget: the reconcile above may have recreated the container
 for i in $(seq 1 "$TRIES"); do
   if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:4112/signin; then READY=1; break; fi
   sleep 2
 done
 if [[ $READY -ne 1 ]]; then
-  if [[ $ENV_CHANGED -eq 1 ]]; then
-    restore_env_and_app
-    die "backend did not become ready at http://127.0.0.1:4112/signin within 60s; .env.local restored, app recreated on previous env (loopback binding kept), nginx NOT reloaded"
-  else
-    die "backend not ready at http://127.0.0.1:4112/signin (env unchanged — pre-existing problem); nginx NOT reloaded"
-  fi
+  restore_env_and_app
+  die "backend did not become ready at http://127.0.0.1:4112/signin within 60s; .env.local restored, app reconciled back on previous env (loopback binding kept), nginx NOT reloaded"
 fi
 log "backend ready on 127.0.0.1:4112 (signed-out /signin returned 200)"
 
 # ------------------------------------------------------- reload nginx (last)
 if ! nginx -t; then
-  die "pre-reload nginx -t failed — config NOT reloaded, running nginx untouched; exit trap restores the managed files"
+  die "pre-reload nginx -t failed — config NOT reloaded, running nginx untouched; exit trap restores the managed files AND .env.local (app reconciled back if it was run on the new env)"
 fi
 ARMED=0   # past this point nothing is rolled back automatically (reload makes it live)
 systemctl reload nginx || die "nginx reload failed — config is valid on disk; check systemctl status nginx"
