@@ -229,23 +229,33 @@ What the script does (idempotent, fail-closed; safe to re-run):
    is never touched), valid ≤365d and always shorter than the CA. The CA
    private key is only referenced for signing — never copied, moved, or
    displayed.
-2. Installs the leaf to `/etc/nginx/ssl/` (key 0600 root, crt 0644) and the
-   Factory site to `/etc/nginx/sites-available/factory` + `sites-enabled`
-   symlink; aborts on unexpected existing targets/symlinks.
-3. Validates with `nginx -t` **before** any reload; on failure it removes
-   the added files and leaves the running nginx untouched.
+2. Refuses to overwrite a pre-existing `/etc/nginx/sites-available/factory`
+   that lacks the `MANAGED-BY: install-local-https.sh` marker (unmanaged
+   site); backs up every managed artifact (site file, sites-enabled
+   symlink, installed leaf cert/key) under `state/tls/` before overwrite.
+3. Runs a baseline `nginx -t` **before** writing anything, validates again
+   before any reload; on any pre-reload failure an EXIT trap restores the
+   backed-up artifacts and the running nginx is never reloaded.
 4. Backs up `.env.local` to `state/tls/` (0600) and sets exactly three keys:
    `MASTRACODE_PUBLIC_URL=https://factory.janet.localdev`,
    `MASTRACODE_ALLOWED_ORIGINS=https://factory.janet.localdev`,
-   `FACTORY_SIGNUP_ENABLED=0` (secrets preserved, never printed).
+   `FACTORY_SIGNUP_ENABLED=0` (secrets preserved, never printed; edits are
+   atomic same-filesystem renames under `state/tls/` that preserve the
+   file's original ownership/mode; the app is recreated only when the env
+   content actually changed).
 5. Recreates only the `app` service (`up -d --no-build --force-recreate
    app` as joelai), polls `http://127.0.0.1:4112/signin` with finite
    retries; if the backend never comes up, it restores the `.env.local`
-   backup and recreates the app on the previous env before failing.
-6. Reloads nginx only after the backend is verified, then checks
+   backup and recreates the app on the previous env before failing. After
+   such a rollback the app **stays on the loopback binding**
+   (`127.0.0.1:4112` per `compose.local.yml`) — plain-HTTP LAN access is
+   not restored.
+6. Reloads nginx only after the backend is verified, then requires
    `https://factory.janet.localdev/signin` → 200 (via
-   `curl --cacert ~/apps/paperclip/tls/ca.crt --resolve`) and a signed-out
-   project endpoint → 401. It does **not** assert login success.
+   `curl --cacert ~/apps/paperclip/tls/ca.crt --resolve`) and
+   `https://factory.janet.localdev/api/factory/projects` → 401 signed-out;
+   it exits non-zero unless both hold. It does **not** assert login
+   success.
 
 Client trust (per device, LAN only) — trust the **root CA only**
 (`ca.crt`); **never** distribute, copy, or import any private key

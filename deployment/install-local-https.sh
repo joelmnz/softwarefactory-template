@@ -11,22 +11,34 @@
 #   docker access; state/ is uid-1000-owned).
 # - Signs the leaf certificate with the existing "Janet LAN Paperclip CA":
 #     CA cert: /home/joelai/apps/paperclip/tls/ca.crt
-#     CA key:  /home/joelai/apps/paperclip/tls/ca.key   (NEVER copied,
-#              displayed, moved, or otherwise altered — only referenced as
-#              the signing key; the CA serial file is never touched because
+#     CA key:  /home/joelai/apps/paperclip/tls/ca.key   (only access-tested
+#              with a stat-level readability check and passed BY PATH to
+#              openssl for signing — never copied, moved, displayed, or
+#              read byte-wise; the CA serial file is never touched because
 #              signing uses an explicit random -set_serial)
 # - Idempotent: reuses a matching, non-expired, CA-valid leaf cert/key pair
 #   under state/tls/ (gitignored) on rerun; re-installs nginx files safely;
-#   re-asserts the three .env.local keys (backup first).
-# - Fails closed: nginx config is validated with `nginx -t` BEFORE any
-#   reload and rolled back (added files removed / prior files restored) if
-#   validation fails; if the app fails to come back healthy after the env
-#   change + recreate, .env.local is restored from the backup and the app is
-#   recreated on the previous env before exiting non-zero. Nothing under
-#   state/ is ever deleted.
+#   re-asserts the three .env.local keys (backup first, app recreated only
+#   if the env content actually changed).
+# - Managed-site marker: the installed Factory nginx site carries a
+#   `MANAGED-BY: install-local-https.sh` marker. If a pre-existing
+#   sites-available/factory lacks it, the script refuses to touch it
+#   (unmanaged site — likely hand-written or from another tool).
+# - Fail closed: a baseline `nginx -t` must pass BEFORE any file is written;
+#   every managed artifact (site file, enabled symlink, installed leaf
+#   cert/key) is backed up under state/tls/ before overwrite; on ANY
+#   pre-reload failure an EXIT trap restores all of them, .env.local is
+#   restored from its backup and the app is recreated on the previous env.
+#   compose.local.yml binds the app to 127.0.0.1:4112, so after a rollback
+#   the app STAYS on the loopback binding (plain-HTTP LAN access is NOT
+#   restored; nginx was never reloaded).
+# - Strict post-reload verification: exit non-zero unless
+#     https://factory.janet.localdev/signin               -> 200
+#     https://factory.janet.localdev/api/factory/projects -> 401 (signed out)
 # - No global CA trust changes, no client installs, no DNS changes. Does not
-#   assert login success (only HTTP-level readiness).
+#   assert login success (only HTTP-level readiness/enforcement).
 set -euo pipefail
+umask 077
 
 log() { printf '[install-local-https] %s\n' "$*"; }
 die() { printf '[install-local-https] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -43,7 +55,10 @@ fi
 CA_CERT="/home/joelai/apps/paperclip/tls/ca.crt"
 CA_KEY="/home/joelai/apps/paperclip/tls/ca.key"
 [[ -r "$CA_CERT" ]] || die "CA cert $CA_CERT not readable"
-[[ -r "$CA_KEY" ]] || die "CA key $CA_KEY not readable (existence is expected; this script never copies or displays it)"
+# Readability check only: a stat-level access test. The CA key's CONTENTS are
+# never copied, moved, displayed, or read by this script — openssl is handed
+# the path alone when signing the leaf.
+[[ -r "$CA_KEY" ]] || die "CA key $CA_KEY not accessible (contents are never read by this script; only the path is passed to openssl for signing)"
 
 STATE_DIR="$ROOT/state/tls"
 NGINX_SSL_DIR="/etc/nginx/ssl"
@@ -55,10 +70,19 @@ SITES_AVAILABLE="/etc/nginx/sites-available/factory"
 SITES_ENABLED="/etc/nginx/sites-enabled/factory"
 HOST="factory.janet.localdev"
 APP_URL="https://factory.janet.localdev"
+MARKER="MANAGED-BY: install-local-https.sh"
 
 COMPOSE=(docker compose --env-file "$ROOT/.env.local" -f "$ROOT/compose.local.yml" --project-directory "$ROOT")
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+
+# Baseline: the on-disk nginx config must be valid BEFORE this script writes
+# anything, so restoring our additions is provably sufficient on rollback.
+if ! nginx -t >/dev/null 2>&1; then
+  nginx -t 2>&1 | sed 's/^/[install-local-https] baseline: /' >&2 || true
+  die "baseline nginx -t FAILED — the config was already broken before this script ran; fix it manually first (nothing was written)"
+fi
+log "baseline nginx -t passed (pre-existing config is valid)"
 
 # The compose file must already bind the app to loopback (the HTTPS worktree
 # change); otherwise recreating the app would leave the old LAN HTTP binding
@@ -72,6 +96,59 @@ if ! runuser -u joelai -- "${COMPOSE[@]}" ps --status running --services | grep 
   die "Factory app container is not currently running — start it first (docker compose --env-file .env.local -f compose.local.yml up -d) and re-run this script"
 fi
 log "pre-flight OK: running as root, primary checkout, CA present, app container running"
+
+# ------------------------------- managed-artifact backups + EXIT-trap rollback
+# Everything this script may overwrite under /etc/nginx is backed up first;
+# if we exit non-zero BEFORE the nginx reload, the trap restores all of it.
+BACKUP_DIR=""
+MANIFEST=""
+ARMED=0
+ensure_backup_dir() {
+  [[ -n "$BACKUP_DIR" ]] && return 0
+  BACKUP_DIR="$STATE_DIR/pre-change-backup-$(date +%Y%m%d-%H%M%S)"
+  MANIFEST="$BACKUP_DIR/manifest"
+  mkdir -m 700 -p "$BACKUP_DIR/files"
+  : > "$MANIFEST"
+  ARMED=1
+  log "backing up managed nginx/ssl artifacts to $BACKUP_DIR before overwrite"
+}
+backup_artifact() { # $1 = live path (file or symlink); records 'absent' if not there yet
+  local p="$1"
+  ensure_backup_dir
+  if [[ -L "$p" ]]; then
+    printf 'symlink\t%s\t%s\n' "$p" "$(readlink "$p")" >> "$MANIFEST"
+  elif [[ -e "$p" ]]; then
+    cp -p --parents "$p" "$BACKUP_DIR/files/"
+    printf 'file\t%s\t-\n' "$p" >> "$MANIFEST"
+  else
+    printf 'absent\t%s\t-\n' "$p" >> "$MANIFEST"
+  fi
+}
+restore_managed() {
+  local kind p arg
+  while IFS=$'\t' read -r kind p arg; do
+    [[ -n "${kind:-}" ]] || continue
+    case "$kind" in
+      absent)  rm -f "$p" ;;
+      symlink) rm -f "$p"; ln -s "$arg" "$p" ;;
+      file)    rm -f "$p"; cp -p "$BACKUP_DIR/files$p" "$p" ;;
+    esac
+  done < "$MANIFEST"
+}
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ $rc -ne 0 && $ARMED -eq 1 ]]; then
+    log "pre-reload failure (rc=$rc) — restoring prior nginx/ssl state from $BACKUP_DIR"
+    restore_managed
+    if nginx -t >/dev/null 2>&1; then
+      log "rollback complete: on-disk nginx config matches the baseline again (nginx was NEVER reloaded, running config untouched)"
+    else
+      log "WARNING: nginx -t still fails after restore — investigate /etc/nginx manually (baseline had passed, so the drift is unexpected)"
+    fi
+  fi
+}
+trap on_exit EXIT
 
 # ------------------------------------------------------------ leaf cert: reuse or issue
 # CA expiry — the leaf must expire strictly BEFORE the CA.
@@ -119,20 +196,12 @@ EOF
   chmod 644 "$LEAF_CRT"
   rm -f "$LEAF_CSR"
   openssl verify -CAfile "$CA_CERT" -purpose sslserver "$LEAF_CRT" >/dev/null \
-    || die "newly issued leaf failed CA verification (CA key untouched; cert discarded is NOT done — inspect $STATE_DIR)"
+    || die "newly issued leaf failed CA verification (CA key untouched — passed by path only; inspect $STATE_DIR and remove the rejected cert manually)"
   log "issued leaf: $(openssl x509 -in "$LEAF_CRT" -noout -subject -enddate | tr '\n' ' ')"
 fi
 
-# ------------------------------------------------- install nginx leaf cert/key
-mkdir -p "$NGINX_SSL_DIR"; chmod 755 "$NGINX_SSL_DIR"
-NGINX_SSL_CRT="$NGINX_SSL_DIR/$HOST.crt"
-NGINX_SSL_KEY="$NGINX_SSL_DIR/$HOST.key"
-install -m 0644 "$LEAF_CRT" "$NGINX_SSL_CRT"
-install -m 0600 -o root -g root "$LEAF_KEY" "$NGINX_SSL_KEY"
-log "installed leaf to $NGINX_SSL_DIR (crt 0644, key 0600 root:root)"
-
 # ---------------------------------------------------- install nginx site file
-# Refuse on unexpected pre-existing targets / symlink conflicts.
+# Refuse on unexpected pre-existing targets / symlink conflicts / unmanaged sites.
 if [[ -e "$SITES_ENABLED" || -L "$SITES_ENABLED" ]]; then
   if [[ -L "$SITES_ENABLED" && "$(readlink -f "$SITES_ENABLED")" == "$SITES_AVAILABLE" ]]; then
     log "sites-enabled/factory already symlinked to sites-available/factory (rerun)"
@@ -143,99 +212,136 @@ fi
 if [[ -e "$SITES_AVAILABLE" && ! -f "$SITES_AVAILABLE" ]]; then
   die "$SITES_AVAILABLE exists and is not a regular file — refusing to overwrite"
 fi
+if [[ -f "$SITES_AVAILABLE" ]] && ! grep -q "$MARKER" "$SITES_AVAILABLE"; then
+  die "$SITES_AVAILABLE exists but lacks the '$MARKER' marker — it is NOT managed by this script; refusing to overwrite an unmanaged Factory site"
+fi
+grep -q "$MARKER" "$ROOT/deployment/nginx-factory.conf" \
+  || die "source conf $ROOT/deployment/nginx-factory.conf is missing the managed-site marker — refusing to install unmarked config"
+
+backup_artifact "$SITES_AVAILABLE"
+if [[ -e "$SITES_ENABLED" || -L "$SITES_ENABLED" ]]; then
+  backup_artifact "$SITES_ENABLED"   # existing correct symlink, preserved on rollback
+fi
 install -m 0644 "$ROOT/deployment/nginx-factory.conf" "$SITES_AVAILABLE"
-if [[ ! -L "$SITES_ENABLED" ]]; then
+if [[ ! -e "$SITES_ENABLED" && ! -L "$SITES_ENABLED" ]]; then
+  backup_artifact "$SITES_ENABLED"   # records 'absent' before we create the link
   ln -s "$SITES_AVAILABLE" "$SITES_ENABLED"
 fi
-log "nginx site installed: $SITES_AVAILABLE -> $SITES_ENABLED"
+log "nginx site installed: $SITES_AVAILABLE (symlinked from $SITES_ENABLED if newly created)"
 
-# --------------------------------- validate BEFORE reload; rollback on failure
-rollback_nginx() {
-  log "rolling back nginx config changes (validation failed)"
-  rm -f "$SITES_ENABLED"
-  rm -f "$SITES_AVAILABLE"
-  if nginx -t >/dev/null 2>&1; then
-    log "rollback complete: nginx config valid again (no reload performed, running config untouched)"
-  else
-    log "WARNING: nginx -t still fails after rollback — nginx config was already broken before this script ran; investigate manually"
-  fi
-}
+# ------------------------------------------------- install nginx leaf cert/key
+mkdir -p "$NGINX_SSL_DIR"; chmod 755 "$NGINX_SSL_DIR"
+NGINX_SSL_CRT="$NGINX_SSL_DIR/$HOST.crt"
+NGINX_SSL_KEY="$NGINX_SSL_DIR/$HOST.key"
+backup_artifact "$NGINX_SSL_CRT"
+backup_artifact "$NGINX_SSL_KEY"
+install -m 0644 "$LEAF_CRT" "$NGINX_SSL_CRT"
+install -m 0600 -o root -g root "$LEAF_KEY" "$NGINX_SSL_KEY"
+log "installed leaf to $NGINX_SSL_DIR (crt 0644, key 0600 root:root)"
+
+# --------------------------------- validate BEFORE reload; EXIT-trap rollback
 if ! nginx -t; then
-  rollback_nginx
-  die "nginx -t failed with the Factory site enabled; config changes rolled back, running nginx untouched"
+  die "nginx -t failed with the Factory site enabled; config changes rolled back by the exit trap, running nginx untouched (no reload happened)"
 fi
 log "nginx -t passed"
 
-# ------------------------------------- runtime env: backup + 3 keys, mode 0600
+# ------------------------------------- runtime env: backup + 3 keys, atomic edit
 ENV_FILE="$ROOT/.env.local"
 [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing"
 ENV_BACKUP="$STATE_DIR/.env.local.backup-$(date +%Y%m%d-%H%M%S)"
 cp -p "$ENV_FILE" "$ENV_BACKUP"; chmod 600 "$ENV_BACKUP"
 log ".env.local backed up to $ENV_BACKUP (values never printed)"
 
-set_env_key() { # file KEY VALUE — replace existing KEY= line or append; comments preserved
+set_env_key() { # file KEY VALUE — replace existing KEY= line or append; comments preserved.
+  # Temp file lives under state/tls (same filesystem as $ROOT) so the final
+  # mv is an atomic same-filesystem rename, never a cross-device copy.
+  # Ownership and mode of the live file are preserved via --reference.
   local file="$1" key="$2" value="$3" tmp
-  tmp="$(mktemp)"; chmod 600 "$tmp"
-  awk -v key="$key" -v value="$value" '
+  tmp="$STATE_DIR/.env.local.edit.$$"
+  if ! awk -v key="$key" -v value="$value" '
     BEGIN { replaced = 0 }
     $0 ~ "^" key "=" { print key "=" value; replaced = 1; next }
     { print }
     END { if (!replaced) print key "=" value }
-  ' "$file" > "$tmp" && mv "$tmp" "$file"
-  chmod 600 "$file"
+  ' "$file" > "$tmp"; then
+    rm -f "$tmp"
+    die "env edit failed for $key (live file untouched)"
+  fi
+  chown --reference "$file" "$tmp"
+  chmod --reference "$file" "$tmp"
+  mv -f "$tmp" "$file"
 }
 set_env_key "$ENV_FILE" "MASTRACODE_PUBLIC_URL" "$APP_URL"
 set_env_key "$ENV_FILE" "MASTRACODE_ALLOWED_ORIGINS" "$APP_URL"
 set_env_key "$ENV_FILE" "FACTORY_SIGNUP_ENABLED" "0"
 [[ "$(grep -c '^MASTRACODE_PUBLIC_URL=' "$ENV_FILE")" -eq 1 && "$(grep -c '^MASTRACODE_ALLOWED_ORIGINS=' "$ENV_FILE")" -eq 1 && "$(grep -c '^FACTORY_SIGNUP_ENABLED=' "$ENV_FILE")" -eq 1 ]] \
-  || { cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod 600 "$ENV_FILE"; die ".env.local key assertion failed after edit; restored from backup"; }
+  || { cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"; die ".env.local key assertion failed after edit; restored from backup"; }
 chmod 600 "$ENV_FILE"
-log ".env.local updated: MASTRACODE_PUBLIC_URL / MASTRACODE_ALLOWED_ORIGINS = $APP_URL, FACTORY_SIGNUP_ENABLED = 0"
+
+ENV_CHANGED=0
+if cmp -s "$ENV_BACKUP" "$ENV_FILE"; then
+  log ".env.local already carries the target values — app recreate skipped"
+else
+  ENV_CHANGED=1
+  log ".env.local updated: MASTRACODE_PUBLIC_URL / MASTRACODE_ALLOWED_ORIGINS = $APP_URL, FACTORY_SIGNUP_ENABLED = 0"
+fi
 
 # ------------------------------------ recreate app as joelai; verify readiness
 restore_env_and_app() {
   log "restoring .env.local from backup and recreating app on the previous env"
-  cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+  cp -p "$ENV_BACKUP" "$ENV_FILE"; chmod --reference "$ENV_BACKUP" "$ENV_FILE"
   runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build --force-recreate app \
     || log "WARNING: restore-recreate of app failed — check docker compose logs manually"
+  # NOTE: compose.local.yml binds 127.0.0.1:4112, so after this rollback the
+  # app STAYS on the loopback binding — plain-HTTP LAN access is NOT restored
+  # (and nginx was never reloaded). LAN reachability is lost until the script
+  # is re-run successfully or the compose binding is changed explicitly.
 }
-if ! runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build --force-recreate app; then
-  restore_env_and_app
-  die "app recreate failed; .env.local restored, app recreated on previous env, nginx NOT reloaded (no config change is live)"
+if [[ $ENV_CHANGED -eq 1 ]]; then
+  if ! runuser -u joelai -- "${COMPOSE[@]}" up -d --no-build --force-recreate app; then
+    restore_env_and_app
+    die "app recreate failed; .env.local restored, app recreated on previous env (loopback binding kept), nginx NOT reloaded"
+  fi
 fi
 
 READY=0
-for i in $(seq 1 30); do
+TRIES=3
+if [[ $ENV_CHANGED -eq 1 ]]; then TRIES=30; fi   # full budget after recreate, short recheck on rerun
+for i in $(seq 1 "$TRIES"); do
   if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:4112/signin; then READY=1; break; fi
   sleep 2
 done
 if [[ $READY -ne 1 ]]; then
-  restore_env_and_app
-  die "backend did not become ready at http://127.0.0.1:4112/signin within 60s; .env.local restored, app recreated on previous env, nginx NOT reloaded"
+  if [[ $ENV_CHANGED -eq 1 ]]; then
+    restore_env_and_app
+    die "backend did not become ready at http://127.0.0.1:4112/signin within 60s; .env.local restored, app recreated on previous env (loopback binding kept), nginx NOT reloaded"
+  else
+    die "backend not ready at http://127.0.0.1:4112/signin (env unchanged — pre-existing problem); nginx NOT reloaded"
+  fi
 fi
-log "backend ready on 127.0.0.1:4112 (signed-in-less /signin returned 200)"
+log "backend ready on 127.0.0.1:4112 (signed-out /signin returned 200)"
 
 # ------------------------------------------------------- reload nginx (last)
-nginx -t || { log "WARNING: nginx -t failed just before reload — config NOT reloaded, running nginx untouched"; die "pre-reload nginx -t failed"; }
+if ! nginx -t; then
+  die "pre-reload nginx -t failed — config NOT reloaded, running nginx untouched; exit trap restores the managed files"
+fi
+ARMED=0   # past this point nothing is rolled back automatically (reload makes it live)
 systemctl reload nginx || die "nginx reload failed — config is valid on disk; check systemctl status nginx"
 
-# ------------------------------------------------------------- post-verification
-TLS_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$CA_CERT" \
-  --resolve "$HOST:443:192.168.1.215" --max-time 15 "$APP_URL/signin" || true)"
-if [[ "$TLS_CODE" == "200" ]]; then
-  log "verified: https://factory.janet.localdev/signin -> 200 via Janet LAN Paperclip CA"
+# ------------------------------------------------------ strict verification
+# REQUIRED: both must hold or the script exits non-zero. No candidate-path
+# probing: the exact endpoints below are mandatory.
+tls_code() { # $1 = path → prints HTTP status (empty on transport error)
+  curl -sS -o /dev/null -w '%{http_code}' --cacert "$CA_CERT" \
+    --resolve "$HOST:443:192.168.1.215" --max-time 15 "$APP_URL$1" 2>/dev/null || true
+}
+SIGNIN_CODE="$(tls_code /signin)"
+PROJ_CODE="$(tls_code /api/factory/projects)"
+if [[ "$SIGNIN_CODE" == "200" && "$PROJ_CODE" == "401" ]]; then
+  log "verified: https://$HOST/signin -> 200 via Janet LAN Paperclip CA"
+  log "verified: https://$HOST/api/factory/projects -> 401 signed-out (auth enforced)"
 else
-  log "WARNING: /signin over HTTPS returned '$TLS_CODE' (expected 200) — inspect nginx error log"
+  die "HTTPS verification FAILED: /signin -> '${SIGNIN_CODE:-<transport error>}' (want 200), /api/factory/projects -> '${PROJ_CODE:-<transport error>}' (want 401 signed-out). nginx config IS live — inspect app/nginx logs and roll back via the pre-change-backup under $STATE_DIR if needed"
 fi
-
-# Signed-out project endpoint should be 401. Try known candidate paths; 404
-# on an unknown path is a documented limitation, not a deployment failure.
-PROJ_OK=0
-for p in /api/projects /api/factory/projects /api/factory/list; do
-  CODE="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$CA_CERT" \
-    --resolve "$HOST:443:192.168.1.215" --max-time 15 "$APP_URL$p" || true)"
-  if [[ "$CODE" == "401" ]]; then PROJ_OK=1; log "verified: $p signed-out -> 401"; break; fi
-done
-if [[ $PROJ_OK -ne 1 ]]; then log "WARNING: no candidate project endpoint returned 401 signed-out — auth enforcement not confirmed by this script"; fi
 
 log "DONE (deployment status: APPLIED). Login success is NOT asserted by this script — sign in via the browser to confirm. Trust the root CA on client devices only (see LOCAL-OPERATIONS.md); never distribute private keys."
