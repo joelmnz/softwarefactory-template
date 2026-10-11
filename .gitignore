@@ -9,5 +9,7 @@ voidauth.txt
 *.log
 .DS_Store
 
-# Local Docker spike: persistent state dirs
+# Local Docker spike: persistent state dirs (incl. local TLS leaf key/cert
+# under state/tls — never commit; root CA key stays in ~/apps/paperclip/tls)
 state/
+state/tls/

@@ -15,10 +15,14 @@
 # Security posture:
 #   - app runs as uid 1000 (non-root), cap_drop ALL, no-new-privileges
 #   - no Docker socket mounted
-#   - app reachable only on the host LAN address 192.168.1.215:4112
-#     (container 4111) — NOT 0.0.0.0, and not loopback anymore
-#   - HTTP only for this spike; do not enter passwords until HTTPS is
-#     configured; LAN binding is NOT proof of protection from the internet
+#   - app binds only 127.0.0.1:4112 (container 4111) — NOT 0.0.0.0 and NOT
+#     the LAN address. LAN devices reach the app through the nginx TLS
+#     reverse proxy (deployment/nginx-factory.conf, installed by
+#     deployment/install-local-https.sh) at https://factory.janet.localdev
+#     (nginx listens on 192.168.1.215:80/443, restricted to the LAN subnet,
+#     and terminates TLS with a leaf cert signed by the Janet LAN Paperclip
+#     CA). Until that script has been applied and verified, the RUNNING
+#     container may still hold the previous 192.168.1.215:4112 HTTP binding.
 #   - db has no host port at all
 name: mastracode-local
 
@@ -34,11 +38,17 @@ services:
       - no-new-privileges:true
     mem_limit: 4g
     ports:
-      # Host LAN address 192.168.1.215:4112 -> container 4111 (Mastra server
-      # default port). Pinned to the LAN IP, not 0.0.0.0, so the app is only
-      # reachable from this host's LAN interface. HTTP only — see
-      # LOCAL-OPERATIONS.md before entering any credentials.
-      - '192.168.1.215:4112:4111'
+      # Loopback-only: container 4111 (Mastra server default port) is exposed
+      # on host 127.0.0.1:4112 so ONLY the local nginx proxy can reach it.
+      # nginx (deployment/nginx-factory.conf) terminates TLS for
+      # https://factory.janet.localdev on 192.168.1.215:443 and proxies to
+      # this loopback port — LAN browsers never talk plain HTTP to the app
+      # (the :80 listener only 301-redirects the Factory host to HTTPS).
+      # Until deployment/install-local-https.sh has been run and verified,
+      # a still-running old container may hold the previous LAN binding
+      # 192.168.1.215:4112 — see LOCAL-OPERATIONS.md for the current
+      # runtime-vs-target status before entering any credentials.
+      - '127.0.0.1:4112:4111'
     environment:
       HOME: /home/node
       MASTRACODE_LOCAL_SANDBOX_ROOT: /sandboxes
