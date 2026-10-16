@@ -234,9 +234,17 @@ Joel approves each rollout explicitly. Run as the operator with an explicit
    docker tag "$OLD_APP_IMAGE" "$ROLLBACK_TAG"   # record this exact tag once
    ```
 
-   Record old **app and db container IDs**, old app image, old tracked commit. Snapshot `.env.local`,
-   TLS files, and setup/config into `$BACKUP` with `cp -a` (preserves permissions/ownership) — never
-   print or commit them.
+   Record old **app and db container IDs**, old app image, old tracked commit. Fresh each upgrade:
+   snapshot `.env.local` and setup/config into `$BACKUP` with `cp -a` (preserves
+   permissions/ownership) — never print or commit them.
+
+   **TLS backup policy (Joel-approved):** snapshot TLS material/config into the backup **only when
+   the TLS material or its config changes** — or when there is no known restorable TLS backup.
+   Otherwise do **not** redundantly copy TLS files: preserve and reference the existing protected
+   backup (same path/permissions as recorded when it was made), never loosen its permissions, and
+   never work around the backup policy via Docker access to the TLS material. For app-only upgrades
+   (no TLS change, existing restorable backup) no redundant TLS copy — in particular no redundant
+   `sudo` TLS copy — is taken.
 3. **Back up PostgreSQL.** The app must be stopped (it is the DB writer; stopping is
    approval-gated), db service stays up. The compose env provides both `POSTGRES_USER` and
    `POSTGRES_DB`; `sh -c` expansion happens inside the container — no placeholder dbuser, no tty.
@@ -252,8 +260,9 @@ Joel approves each rollout explicitly. Run as the operator with an explicit
      > "$BACKUP/database.dump"
    echo "dump exit: $?"   # must be 0 — record it
    test -s "$BACKUP/database.dump" && wc -c < "$BACKUP/database.dump"
+   # pg_restore -l reads the dump from stdin when no file argument is given:
    docker compose --env-file .env.local -f compose.local.yml exec -T db \
-     sh -c 'exec pg_restore -l /dev/stdin' \
+     sh -c 'exec pg_restore -l' \
      < "$BACKUP/database.dump" > "$BACKUP/dump.toc"
    echo "toc exit: $?"    # must be 0 — TOC metadata only, never DB data
    ```
