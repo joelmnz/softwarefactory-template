@@ -24,7 +24,7 @@
     "@mastra/pg": "1.31.2",
     "@mastra/platform-workspace": "1.8.1",
     "@mastra/redis-streams": "0.6.3",
-    "zod": "^4.3.6",
+    "zod": "^4.6.7",
     "@mastra/memory": "1.38.0"
   },
   "devDependencies": {
